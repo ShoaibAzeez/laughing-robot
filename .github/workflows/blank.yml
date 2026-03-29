@@ -1,0 +1,119 @@
+name: Secure Self-Hosted RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: [self-hosted, windows, x64]
+    timeout-minutes: 240
+
+    env:
+      RDP_USERNAME: RDP
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+
+    steps:
+      - name: Configure secure RDP
+        shell: powershell
+        run: |
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+
+          # Keep NLA enabled
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 1 -Force
+
+          # Use TLS security layer where supported
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" -Value 2 -Force
+
+          # Enable built-in Remote Desktop firewall rules only
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          Restart-Service -Name TermService -Force
+
+      - name: Create or update local RDP user
+        shell: powershell
+        run: |
+          $username = $env:RDP_USERNAME
+          $password = $env:RDP_PASSWORD
+
+          if ([string]::IsNullOrWhiteSpace($password)) {
+            Write-Error "RDP_PASSWORD secret is empty."
+            exit 1
+          }
+
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          $existing = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+
+          if ($existing) {
+            Set-LocalUser -Name $username -Password $securePass
+          } else {
+            New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
+          }
+
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
+
+      - name: Install Tailscale if missing
+        shell: powershell
+        run: |
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tsExe)) {
+            $installerPath = "$env:TEMP\tailscale-setup.exe"
+            Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile $installerPath
+            Start-Process -FilePath $installerPath -ArgumentList "/install /quiet /norestart" -Wait
+            Remove-Item $installerPath -Force
+          }
+
+      - name: Connect Tailscale
+        shell: powershell
+        run: |
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          & $tsExe up --auth-key=$env:TAILSCALE_AUTH_KEY --unattended=true
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "tailscale up failed"
+            exit 1
+          }
+
+          $tsIP = $null
+          for ($i = 0; $i -lt 12; $i++) {
+            $tsIP = (& $tsExe ip -4 | Select-Object -First 1).Trim()
+            if ($tsIP) { break }
+            Start-Sleep -Seconds 5
+          }
+
+          if (-not $tsIP) {
+            Write-Error "No Tailscale IPv4 assigned."
+            exit 1
+          }
+
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Verify local RDP listener
+        shell: powershell
+        run: |
+          $check = Test-NetConnection -ComputerName 127.0.0.1 -Port 3389
+          if (-not $check.TcpTestSucceeded) {
+            Write-Error "Local RDP listener is not reachable on port 3389."
+            exit 1
+          }
+
+      - name: Show connection info
+        shell: powershell
+        run: |
+          Write-Host "RDP is ready."
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "Username: $env:RDP_USERNAME"
+          Write-Host "Password is stored in GitHub Secret: RDP_PASSWORD"
+
+      - name: Keep job alive
+        shell: powershell
+        run: |
+          while ($true) {
+            Write-Host "[$(Get-Date)] Self-hosted runner online"
+            Start-Sleep -Seconds 300
+          }
